@@ -2,11 +2,13 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/roman-mazur/architecture-practice-4-template/httptools"
@@ -87,19 +89,81 @@ func forward(dst string, rw http.ResponseWriter, r *http.Request) error {
 func main() {
 	flag.Parse()
 
-	// TODO: Використовуйте дані про стан сервера, щоб підтримувати список тих серверів, яким можна відправляти запит.
+	type trafficStat struct {
+		Traffic int
+		Healthy bool
+	}
+
+	var trafficMap = make(map[string]*trafficStat)
+
 	for _, server := range serversPool {
-		server := server
+		trafficMap[server] = &trafficStat{Traffic: 0, Healthy: false}
+	}
+
+	// Періодично оновлюємо статистику
+	for _, server := range serversPool {
+		srv := server
 		go func() {
-			for range time.Tick(10 * time.Second) {
-				log.Println(server, "healthy:", health(server))
+			for range time.Tick(5 * time.Second) {
+				healthy := health(srv)
+				trafficMap[srv].Healthy = healthy
+				if healthy {
+					url := fmt.Sprintf("%s://%s/report", scheme(), srv)
+					resp, err := http.Get(url)
+					if err != nil {
+						log.Printf("error getting report from %s: %s", srv, err)
+						continue
+					}
+					var data map[string][]string
+					if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+						log.Printf("error decoding report from %s: %s", srv, err)
+						continue
+					}
+					resp.Body.Close()
+
+					total := 0
+					for _, val := range data["responses"] {
+						n, err := strconv.Atoi(val)
+						if err == nil {
+							total += n
+						}
+					}
+					// Підрізаємо до останніх 5, якщо потрібно
+					if len(data["responses"]) > 5 {
+						data["responses"] = data["responses"][len(data["responses"])-5:]
+					}
+					trafficMap[srv].Traffic = total
+					if trafficMap[srv].Healthy {
+						log.Printf("Updated traffic from %s: %d healthy", srv, total)
+					} else {
+						log.Printf("Updated traffic from %s: %d dead", srv, total)
+					}
+				}
 			}
 		}()
 	}
 
 	frontend := httptools.CreateServer(*port, http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
-		// TODO: Реалізуйте свій алгоритм балансувальника.
-		forward(serversPool[0], rw, r)
+		// Вибір сервера з мінімальним трафіком
+		bestServer := ""
+		minTraffic := -1
+		for server, stat := range trafficMap {
+			if !stat.Healthy {
+				continue
+			}
+			if minTraffic == -1 || stat.Traffic < minTraffic {
+				minTraffic = stat.Traffic
+				bestServer = server
+			}
+		}
+
+		if bestServer == "" {
+			http.Error(rw, "No healthy servers available", http.StatusServiceUnavailable)
+			return
+		}
+
+		log.Printf("Forwarding request to %s (traffic: %d)", bestServer, minTraffic)
+		forward(bestServer, rw, r)
 	}))
 
 	log.Println("Starting load balancer...")
