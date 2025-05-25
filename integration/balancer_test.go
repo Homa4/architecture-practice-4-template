@@ -19,33 +19,39 @@ func TestBalancer(t *testing.T) {
 		t.Skip("Integration test is not enabled")
 	}
 
-	serverSet := make(map[string]bool)
+	count := make(map[string]int)
 
-	for i := 0; i < 20; i++ {
+	// Викликаємо балансувальник кілька разів
+	for i := 0; i < 10; i++ {
 		resp, err := client.Get(fmt.Sprintf("%s/api/v1/some-data", baseAddress))
 		if err != nil {
-			t.Fatalf("Request failed: %v", err)
+			t.Errorf("request %d failed: %s", i, err)
+			continue
 		}
-
-		lbFrom := resp.Header.Get("lb")
-		if lbFrom == "" {
-			t.Fatalf("Missing lb-from header in response")
+		server := resp.Header.Get("lb-from")
+		if server == "" {
+			t.Errorf("request %d: missing lb-from header", i)
 		}
-		serverSet[lbFrom] = true
+		count[server]++
 		resp.Body.Close()
 	}
 
-	if len(serverSet) < 2 {
-		t.Errorf("Expected responses from at least 2 servers, got: %v", serverSet)
+	if len(count) < 2 {
+		t.Errorf("Expected requests to be distributed to at least 2 servers, got: %+v", count)
 	}
+
+	t.Logf("Load distribution: %+v", count)
 }
+
 
 func BenchmarkBalancer(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		resp, err := client.Get(fmt.Sprintf("%s/api/v1/some-data", baseAddress))
 		if err != nil {
-			b.Fatalf("Request failed: %v", err)
+			b.Error(err)
+			continue
 		}
 		resp.Body.Close()
 	}
 }
+
