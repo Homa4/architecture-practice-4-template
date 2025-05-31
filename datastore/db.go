@@ -27,6 +27,7 @@ type hashIndex map[string]int64
 type writeRequest struct {
 	key      string
 	value    string
+	isDelete bool
 	response chan error
 }
 
@@ -41,10 +42,8 @@ type Db struct {
 	indexMu  sync.RWMutex
 
 	writeQueue chan writeRequest
-
-	shutdown chan struct{}
-
-	wg sync.WaitGroup
+	shutdown   chan struct{}
+	wg         sync.WaitGroup
 }
 
 func Open(dir string) (*Db, error) {
@@ -89,21 +88,47 @@ func (db *Db) writerLoop() {
 	for {
 		select {
 		case req := <-db.writeQueue:
-			err := db.performWrite(req.key, req.value)
+			var err error
+			if req.isDelete {
+				err = db.performDelete(req.key)
+			} else {
+				err = db.performWrite(req.key, req.value)
+			}
 			req.response <- err
 
 		case <-db.shutdown:
-
 			for {
 				select {
 				case req := <-db.writeQueue:
-					err := db.performWrite(req.key, req.value)
+					var err error
+					if req.isDelete {
+						err = db.performDelete(req.key)
+					} else {
+						err = db.performWrite(req.key, req.value)
+					}
 					req.response <- err
 				default:
 					return
 				}
 			}
 		}
+	}
+}
+
+func (db *Db) Delete(key string) error {
+	response := make(chan error, 1)
+
+	req := writeRequest{
+		key:      key,
+		isDelete: true,
+		response: response,
+	}
+
+	select {
+	case db.writeQueue <- req:
+		return <-response
+	case <-db.shutdown:
+		return fmt.Errorf("database is shutting down")
 	}
 }
 
@@ -139,8 +164,49 @@ func (db *Db) performWrite(key, value string) error {
 	return nil
 }
 
-func (db *Db) recover() error {
+const deletedMarker = "\x00DELETED\x00"
 
+func (e *entry) markAsDeleted() {
+	e.value = deletedMarker
+}
+
+func (e *entry) isDeleted() bool {
+	return e.value == deletedMarker
+}
+
+func (db *Db) performDelete(key string) error {
+	e := entry{
+		key:   key,
+		value: "",
+	}
+	e.markAsDeleted()
+
+	currentSize, err := db.getCurrentFileSize()
+	if err != nil {
+		return err
+	}
+
+	encodedEntry := e.Encode()
+	if currentSize+int64(len(encodedEntry)) > db.maxSegmentSize {
+		err := db.rotateSegment()
+		if err != nil {
+			return err
+		}
+	}
+
+	_, err = db.out.Write(encodedEntry)
+	if err != nil {
+		return err
+	}
+
+	db.indexMu.Lock()
+	delete(db.index, key)
+	db.indexMu.Unlock()
+
+	return nil
+}
+
+func (db *Db) recover() error {
 	files, err := os.ReadDir(db.dir)
 	if err != nil {
 		return err
@@ -199,7 +265,9 @@ func (db *Db) recoverFromFile(filePath string) error {
 			return err
 		}
 
-		db.index[record.key] = offset
+		if !record.isDeleted() {
+			db.index[record.key] = offset
+		}
 		offset += int64(n)
 	}
 
@@ -229,7 +297,9 @@ func (db *Db) recoverFromCurrentFile() error {
 			return err
 		}
 
-		db.index[record.key] = offset
+		if !record.isDeleted() {
+			db.index[record.key] = offset
+		}
 		offset += int64(n)
 	}
 
@@ -251,7 +321,6 @@ func extractSegmentNumber(filename string) int {
 }
 
 func (db *Db) Close() error {
-
 	close(db.shutdown)
 
 	db.wg.Wait()
@@ -309,7 +378,6 @@ func (db *Db) getFromFile(filePath string, position int64) (string, error) {
 }
 
 func (db *Db) Put(key, value string) error {
-
 	response := make(chan error, 1)
 
 	req := writeRequest{
@@ -320,7 +388,6 @@ func (db *Db) Put(key, value string) error {
 
 	select {
 	case db.writeQueue <- req:
-
 		return <-response
 	case <-db.shutdown:
 		return fmt.Errorf("database is shutting down")
@@ -336,7 +403,6 @@ func (db *Db) getCurrentFileSize() (int64, error) {
 }
 
 func (db *Db) rotateSegment() error {
-
 	if err := db.out.Close(); err != nil {
 		return err
 	}
@@ -473,7 +539,9 @@ func (db *Db) readSegmentIntoMap(segmentPath string, data map[string]string) err
 			return err
 		}
 
-		data[record.key] = record.value
+		if !record.isDeleted() {
+			data[record.key] = record.value
+		}
 	}
 
 	return nil
@@ -499,7 +567,9 @@ func (db *Db) rebuildCurrentIndex(index hashIndex) error {
 			return err
 		}
 
-		index[record.key] = offset
+		if !record.isDeleted() {
+			index[record.key] = offset
+		}
 		offset += int64(n)
 	}
 
