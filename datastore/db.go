@@ -15,29 +15,36 @@ import (
 )
 
 const (
-	outFileName        = "current-data"
-	segmentPrefix      = "segment-"
-	defaultMaxSegSize  = 10 * 1024 * 1024 // 10MB
+	outFileName       = "current-data"
+	segmentPrefix     = "segment-"
+	defaultMaxSegSize = 10 * 1024 * 1024
 )
 
 var ErrNotFound = fmt.Errorf("record does not exist")
 
 type hashIndex map[string]int64
 
-// type segmentInfo struct { ???
-// 	path   string
-// 	offset int64
-// }
+type writeRequest struct {
+	key      string
+	value    string
+	response chan error
+}
 
 type Db struct {
-	dir           string
-	out           *os.File
-	outOffset     int64
+	dir            string
+	out            *os.File
+	outOffset      int64
 	maxSegmentSize int64
 
 	index    hashIndex
-	segments []string // список файлів сегментів
-	mu       sync.RWMutex
+	segments []string
+	indexMu  sync.RWMutex
+
+	writeQueue chan writeRequest
+
+	shutdown chan struct{}
+
+	wg sync.WaitGroup
 }
 
 func Open(dir string) (*Db, error) {
@@ -61,6 +68,8 @@ func OpenWithSegmentSize(dir string, maxSegmentSize int64) (*Db, error) {
 		maxSegmentSize: maxSegmentSize,
 		index:          make(hashIndex),
 		segments:       make([]string, 0),
+		writeQueue:     make(chan writeRequest, 100),
+		shutdown:       make(chan struct{}),
 	}
 
 	err = db.recover()
@@ -68,11 +77,70 @@ func OpenWithSegmentSize(dir string, maxSegmentSize int64) (*Db, error) {
 		return nil, err
 	}
 
+	db.wg.Add(1)
+	go db.writerLoop()
+
 	return db, nil
 }
 
+func (db *Db) writerLoop() {
+	defer db.wg.Done()
+
+	for {
+		select {
+		case req := <-db.writeQueue:
+			err := db.performWrite(req.key, req.value)
+			req.response <- err
+
+		case <-db.shutdown:
+
+			for {
+				select {
+				case req := <-db.writeQueue:
+					err := db.performWrite(req.key, req.value)
+					req.response <- err
+				default:
+					return
+				}
+			}
+		}
+	}
+}
+
+func (db *Db) performWrite(key, value string) error {
+	e := entry{
+		key:   key,
+		value: value,
+	}
+
+	currentSize, err := db.getCurrentFileSize()
+	if err != nil {
+		return err
+	}
+
+	encodedEntry := e.Encode()
+	if currentSize+int64(len(encodedEntry)) > db.maxSegmentSize {
+		err := db.rotateSegment()
+		if err != nil {
+			return err
+		}
+	}
+
+	n, err := db.out.Write(encodedEntry)
+	if err != nil {
+		return err
+	}
+
+	db.indexMu.Lock()
+	db.index[key] = db.outOffset
+	db.indexMu.Unlock()
+
+	db.outOffset += int64(n)
+	return nil
+}
+
 func (db *Db) recover() error {
-	// Спочатку знаходимо всі файли сегментів
+
 	files, err := os.ReadDir(db.dir)
 	if err != nil {
 		return err
@@ -85,7 +153,6 @@ func (db *Db) recover() error {
 		}
 	}
 
-	// Сортуємо сегменти за номером
 	sort.Slice(segmentFiles, func(i, j int) bool {
 		numI := extractSegmentNumber(segmentFiles[i])
 		numJ := extractSegmentNumber(segmentFiles[j])
@@ -94,7 +161,6 @@ func (db *Db) recover() error {
 
 	db.segments = segmentFiles
 
-	// Відновлюємо індекс з сегментів (від старіших до новіших)
 	for _, segmentFile := range segmentFiles {
 		err := db.recoverFromFile(filepath.Join(db.dir, segmentFile))
 		if err != nil && err != io.EOF {
@@ -102,7 +168,6 @@ func (db *Db) recover() error {
 		}
 	}
 
-	// Відновлюємо індекс з поточного файлу
 	err = db.recoverFromCurrentFile()
 	if err != nil && err != io.EOF {
 		return err
@@ -134,7 +199,6 @@ func (db *Db) recoverFromFile(filePath string) error {
 			return err
 		}
 
-		// Оновлюємо індекс (новіші записи перезаписують старіші)
 		db.index[record.key] = offset
 		offset += int64(n)
 	}
@@ -178,7 +242,7 @@ func extractSegmentNumber(filename string) int {
 	if len(parts) < 2 {
 		return 0
 	}
-	
+
 	num, err := strconv.Atoi(parts[1])
 	if err != nil {
 		return 0
@@ -187,9 +251,11 @@ func extractSegmentNumber(filename string) int {
 }
 
 func (db *Db) Close() error {
-	db.mu.Lock()
-	defer db.mu.Unlock()
-	
+
+	close(db.shutdown)
+
+	db.wg.Wait()
+
 	if db.out != nil {
 		return db.out.Close()
 	}
@@ -197,23 +263,21 @@ func (db *Db) Close() error {
 }
 
 func (db *Db) Get(key string) (string, error) {
-	db.mu.RLock()
+	db.indexMu.RLock()
 	position, ok := db.index[key]
 	segments := make([]string, len(db.segments))
 	copy(segments, db.segments)
-	db.mu.RUnlock()
+	db.indexMu.RUnlock()
 
 	if !ok {
 		return "", ErrNotFound
 	}
 
-	// Спочатку шукаємо в поточному файлі
 	value, err := db.getFromFile(db.out.Name(), position)
 	if err == nil {
 		return value, nil
 	}
 
-	// Якщо не знайшли в поточному файлі, шукаємо в сегментах
 	for i := len(segments) - 1; i >= 0; i-- {
 		segmentPath := filepath.Join(db.dir, segments[i])
 		value, err := db.getFromFile(segmentPath, position)
@@ -245,34 +309,22 @@ func (db *Db) getFromFile(filePath string, position int64) (string, error) {
 }
 
 func (db *Db) Put(key, value string) error {
-	db.mu.Lock()
-	defer db.mu.Unlock()
 
-	e := entry{
-		key:   key,
-		value: value,
+	response := make(chan error, 1)
+
+	req := writeRequest{
+		key:      key,
+		value:    value,
+		response: response,
 	}
 
-	// Перевіряємо, чи потрібно створити новий сегмент
-	currentSize, err := db.getCurrentFileSize()
-	if err != nil {
-		return err
-	}
+	select {
+	case db.writeQueue <- req:
 
-	encodedEntry := e.Encode()
-	if currentSize+int64(len(encodedEntry)) > db.maxSegmentSize {
-		err := db.rotateSegment()
-		if err != nil {
-			return err
-		}
+		return <-response
+	case <-db.shutdown:
+		return fmt.Errorf("database is shutting down")
 	}
-
-	n, err := db.out.Write(encodedEntry)
-	if err == nil {
-		db.index[key] = db.outOffset
-		db.outOffset += int64(n)
-	}
-	return err
 }
 
 func (db *Db) getCurrentFileSize() (int64, error) {
@@ -284,25 +336,23 @@ func (db *Db) getCurrentFileSize() (int64, error) {
 }
 
 func (db *Db) rotateSegment() error {
-	// Закриваємо поточний файл
+
 	if err := db.out.Close(); err != nil {
 		return err
 	}
 
-	// Створюємо новий сегмент з поточного файлу
 	segmentName := fmt.Sprintf("%s%d", segmentPrefix, time.Now().UnixNano())
 	segmentPath := filepath.Join(db.dir, segmentName)
 	currentPath := filepath.Join(db.dir, outFileName)
 
-	// Перейменовуємо поточний файл в сегмент
 	if err := os.Rename(currentPath, segmentPath); err != nil {
 		return err
 	}
 
-	// Додаємо сегмент до списку
+	db.indexMu.Lock()
 	db.segments = append(db.segments, segmentName)
+	db.indexMu.Unlock()
 
-	// Створюємо новий поточний файл
 	f, err := os.OpenFile(currentPath, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0o600)
 	if err != nil {
 		return err
@@ -315,9 +365,6 @@ func (db *Db) rotateSegment() error {
 }
 
 func (db *Db) Size() (int64, error) {
-	db.mu.RLock()
-	defer db.mu.RUnlock()
-	
 	info, err := db.out.Stat()
 	if err != nil {
 		return 0, err
@@ -326,14 +373,13 @@ func (db *Db) Size() (int64, error) {
 }
 
 func (db *Db) MergeSegments() error {
-	db.mu.Lock()
-	defer db.mu.Unlock()
+	db.indexMu.Lock()
+	defer db.indexMu.Unlock()
 
 	if len(db.segments) < 2 {
-		return nil // Немає чого зливати
+		return nil
 	}
 
-	// Створюємо тимчасовий файл для злиття
 	tempMergedPath := filepath.Join(db.dir, "temp-merged-"+strconv.FormatInt(time.Now().UnixNano(), 10))
 	tempFile, err := os.OpenFile(tempMergedPath, os.O_WRONLY|os.O_CREATE, 0o600)
 	if err != nil {
@@ -342,13 +388,11 @@ func (db *Db) MergeSegments() error {
 
 	defer func() {
 		tempFile.Close()
-		os.Remove(tempMergedPath) // Видаляємо тимчасовий файл у випадку помилки
+		os.Remove(tempMergedPath)
 	}()
 
-	// Збираємо всі унікальні ключі з їх найновішими значеннями
 	mergedData := make(map[string]string)
-	
-	// Читаємо дані з сегментів (від старіших до новіших)
+
 	for _, segmentFile := range db.segments {
 		segmentPath := filepath.Join(db.dir, segmentFile)
 		err := db.readSegmentIntoMap(segmentPath, mergedData)
@@ -357,19 +401,18 @@ func (db *Db) MergeSegments() error {
 		}
 	}
 
-	// Записуємо злиті дані у тимчасовий файл
 	var offset int64
 	newIndex := make(hashIndex)
-	
+
 	for key, value := range mergedData {
 		entry := entry{key: key, value: value}
 		encoded := entry.Encode()
-		
+
 		n, err := tempFile.Write(encoded)
 		if err != nil {
 			return err
 		}
-		
+
 		newIndex[key] = offset
 		offset += int64(n)
 	}
@@ -379,37 +422,32 @@ func (db *Db) MergeSegments() error {
 	}
 	tempFile.Close()
 
-	// Атомарно замінюємо старі сегменти новим
 	newSegmentName := fmt.Sprintf("%s%d", segmentPrefix, time.Now().UnixNano())
 	newSegmentPath := filepath.Join(db.dir, newSegmentName)
-	
+
 	if err := os.Rename(tempMergedPath, newSegmentPath); err != nil {
 		return err
 	}
 
-	// Видаляємо старі сегменти
 	for _, segmentFile := range db.segments {
 		segmentPath := filepath.Join(db.dir, segmentFile)
-		os.Remove(segmentPath) // Ігноруємо помилки видалення
+		os.Remove(segmentPath)
 	}
 
-	// Оновлюємо список сегментів
 	db.segments = []string{newSegmentName}
 
-	// Оновлюємо індекс з поточного файлу
 	currentIndex := make(hashIndex)
 	err = db.rebuildCurrentIndex(currentIndex)
 	if err != nil {
 		return err
 	}
 
-	// Об'єднуємо індекси (поточний файл має пріоритет)
 	for key, position := range newIndex {
 		if _, exists := currentIndex[key]; !exists {
 			db.index[key] = position
 		}
 	}
-	
+
 	for key, position := range currentIndex {
 		db.index[key] = position
 	}
@@ -434,10 +472,10 @@ func (db *Db) readSegmentIntoMap(segmentPath string, data map[string]string) err
 		if err != nil {
 			return err
 		}
-		
+
 		data[record.key] = record.value
 	}
-	
+
 	return nil
 }
 
