@@ -1,8 +1,6 @@
 networks:
   servers:
-
 services:
-
   balancer:
     build: .
     command: "lb"
@@ -17,6 +15,10 @@ services:
       - servers
     ports:
       - "8080:8080"
+    environment:
+      - DB_SERVICE_URL=http://db:8083
+    depends_on:
+      - db
 
   server2:
     build: .
@@ -24,6 +26,10 @@ services:
       - servers
     ports:
       - "8081:8080"
+    environment:
+      - DB_SERVICE_URL=http://db:8083
+    depends_on:
+      - db
 
   server3:
     build: .
@@ -31,3 +37,23 @@ services:
       - servers
     ports:
       - "8082:8080"
+    environment:
+      - DB_SERVICE_URL=http://db:8083
+    depends_on:
+      - db
+
+  db:
+    build: .
+    command: "db"
+    networks:
+      - servers
+    ports:
+      - "8083:8083" # Новий порт для БД сервісу
+    environment:
+      - PORT=8083
+      - DB_PATH=/app/db-data
+    volumes:
+      - db_data:/app/db-data
+
+volumes:
+  db_data:
