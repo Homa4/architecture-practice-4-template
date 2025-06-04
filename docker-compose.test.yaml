@@ -5,6 +5,8 @@ services:
       dockerfile: Dockerfile.test
     networks:
       - servers
+    environment:
+      - TEAM_NAME=choco_pie
     depends_on:
       - server1
       - server2
@@ -12,5 +14,4 @@ services:
       - balancer
 
   balancer:
-    # Для тестів включаємо режим відлагодження, коли балансувальник додає інформацію, кому було відправлено запит.
     command: ["lb", "--trace=true"]

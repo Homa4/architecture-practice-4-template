@@ -20,6 +20,12 @@ var port = flag.Int("port", 8080, "server port")
 const confResponseDelaySec = "CONF_RESPONSE_DELAY_SEC"
 const confHealthFailure = "CONF_HEALTH_FAILURE"
 const confTeamName = "CONF_TEAM_NAME"
+const confDBHost = "CONF_DB_HOST"
+
+type APIResponse struct {
+	Key   string `json:"key"`
+	Value string `json:"value"`
+}
 
 type DBRequest struct {
 	Value string `json:"value"`
@@ -30,90 +36,84 @@ type DBResponse struct {
 	Value string `json:"value"`
 }
 
-type DBClient struct {
-	baseURL string
-	client  *http.Client
-}
-
-func NewDBClient(baseURL string) *DBClient {
-	return &DBClient{
-		baseURL: baseURL,
-		client:  http.DefaultClient,
-	}
-}
-
-func (db *DBClient) Put(key, value string) error {
-	url := fmt.Sprintf("%s/db/%s", db.baseURL, key)
-	
-	reqBody := DBRequest{Value: value}
-	jsonBody, err := json.Marshal(reqBody)
-	if err != nil {
-		return fmt.Errorf("failed to marshal request: %w", err)
-	}
-
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonBody))
-	if err != nil {
-		return fmt.Errorf("failed to create request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := db.client.Do(req)
-	if err != nil {
-		return fmt.Errorf("failed to send request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("database request failed with status: %d", resp.StatusCode)
-	}
-
-	return nil
-}
-
-func (db *DBClient) Get(key string) (string, error) {
-	url := fmt.Sprintf("%s/db/%s", db.baseURL, key)
-	
-	resp, err := db.client.Get(url)
-	if err != nil {
-		return "", fmt.Errorf("failed to send request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == http.StatusNotFound {
-		return "", fmt.Errorf("key not found")
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("database request failed with status: %d", resp.StatusCode)
-	}
-
-	var dbResp DBResponse
-	if err := json.NewDecoder(resp.Body).Decode(&dbResp); err != nil {
-		return "", fmt.Errorf("failed to decode response: %w", err)
-	}
-
-	return dbResp.Value, nil
-}
-
-func main() {
-	dbServiceURL := os.Getenv("DB_SERVICE_URL")
-	if dbServiceURL == "" {
-		dbServiceURL = "http://localhost:8083"
-	}
-
-	dbClient := NewDBClient(dbServiceURL)
-
+func initializeTeamData() error {
 	teamName := os.Getenv(confTeamName)
 	if teamName == "" {
 		teamName = "default-team"
 	}
 
-	currentDate := time.Now().Format("2006-01-02")
-	if err := dbClient.Put(teamName, currentDate); err != nil {
-		log.Printf("Warning: failed to initialize team data in database: %v", err)
-	} else {
-		log.Printf("Initialized team '%s' with date: %s", teamName, currentDate)
+	dbHost := os.Getenv(confDBHost)
+	if dbHost == "" {
+		dbHost = "db:8083"
 	}
+
+	currentDate := time.Now().Format("2006-01-02")
+
+	reqBody := DBRequest{Value: currentDate}
+	jsonData, err := json.Marshal(reqBody)
+	if err != nil {
+		return fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	maxRetries := 30
+	for i := 0; i < maxRetries; i++ {
+		url := fmt.Sprintf("http://%s/db/%s", dbHost, teamName)
+		resp, err := http.Post(url, "application/json", bytes.NewBuffer(jsonData))
+		if err == nil {
+			defer resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				log.Printf("Successfully initialized team data: %s = %s", teamName, currentDate)
+				return nil
+			}
+		}
+
+		log.Printf("Attempt %d/%d: Waiting for database to be ready...", i+1, maxRetries)
+		time.Sleep(1 * time.Second)
+	}
+
+	return fmt.Errorf("failed to initialize team data after %d attempts", maxRetries)
+}
+
+func getDataFromDB(key string) (*APIResponse, error) {
+	dbHost := os.Getenv(confDBHost)
+	if dbHost == "" {
+		dbHost = "db:8083"
+	}
+
+	url := fmt.Sprintf("http://%s/db/%s", dbHost, key)
+	resp, err := http.Get(url)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get from database: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, nil
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("database returned status %d", resp.StatusCode)
+	}
+
+	var dbResp DBResponse
+	if err := json.NewDecoder(resp.Body).Decode(&dbResp); err != nil {
+		return nil, fmt.Errorf("failed to decode database response: %w", err)
+	}
+
+	return &APIResponse{
+		Key:   dbResp.Key,
+		Value: dbResp.Value,
+	}, nil
+}
+
+func main() {
+	flag.Parse()
+
+	go func() {
+		if err := initializeTeamData(); err != nil {
+			log.Printf("Warning: Failed to initialize team data: %v", err)
+		}
+	}()
 
 	h := new(http.ServeMux)
 
@@ -140,24 +140,27 @@ func main() {
 
 		key := r.URL.Query().Get("key")
 		if key == "" {
-			http.Error(rw, "Missing key parameter", http.StatusBadRequest)
+			http.Error(rw, "Key parameter is required", http.StatusBadRequest)
 			return
 		}
 
-		value, err := dbClient.Get(key)
+		data, err := getDataFromDB(key)
 		if err != nil {
+			log.Printf("Database error: %v", err)
+			http.Error(rw, "Internal server error", http.StatusInternalServerError)
+			return
+		}
+
+		if data == nil {
 			rw.WriteHeader(http.StatusNotFound)
 			return
 		}
 
 		rw.Header().Set("content-type", "application/json")
 		rw.WriteHeader(http.StatusOK)
-		
-		response := map[string]interface{}{
-			"key":   key,
-			"value": value,
+		if err := json.NewEncoder(rw).Encode(data); err != nil {
+			log.Printf("Failed to encode response: %v", err)
 		}
-		_ = json.NewEncoder(rw).Encode(response)
 	})
 
 	h.Handle("/report", report)
